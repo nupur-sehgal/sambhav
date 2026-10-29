@@ -1,0 +1,8 @@
+pymongo>=4.19,<5
+python-dotenv>=1.0
+sentence-transformers>=6.2,<7
+langchain>=1.4,<2
+langchain-core>=1.7,<2
+langchain-google-genai
+langgraph>=1.2,<2
+streamlit>=1.66,<2
