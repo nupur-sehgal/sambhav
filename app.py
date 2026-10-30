@@ -1,11 +1,9 @@
+import os
 
 import streamlit as st
-from graph import ask
-from db import get_collection_names, collection
-
 
 # --------------------------------------------------
-# 1. Page setup
+# 1. Page setup (must be the first Streamlit call)
 # --------------------------------------------------
 
 st.set_page_config(
@@ -15,83 +13,123 @@ st.set_page_config(
 )
 
 st.title("💬 Sambhav — MongoDB RAG Chatbot")
-st.caption("Learn how LangChain, LangGraph, and MongoDB work together")
+st.caption("Ask questions about your MongoDB data in plain English")
+
+# Importing these reads .env and builds the graph. A setup mistake (for example
+# a missing MONGODB_URI) is shown on the page instead of as a raw traceback.
+try:
+    from db import collection, get_collection_names, ping
+    from graph import ask
+except Exception as exc:
+    st.error(f"Setup problem: {exc}")
+    st.stop()
+
+# Set SHOW_DEBUG=true in .env while developing to see error details on the page.
+SHOW_DEBUG = os.getenv("SHOW_DEBUG", "false").strip().lower() == "true"
+
+EXAMPLE_QUESTIONS = [
+    "What is a DBMS?",
+    "Explain primary keys.",
+    "How many documents are in this collection?",
+]
+
+HISTORY_MESSAGES = 6  # earlier messages sent to the graph for follow-up questions
 
 
 # --------------------------------------------------
-# 2. Helper functions
+# 2. Helpers
 # --------------------------------------------------
 
-def check_mongodb_connection():
-    """Check whether MongoDB responds to a ping."""
-    collection.database.client.admin.command("ping")
-    return True
+@st.cache_data(ttl=60, show_spinner=False)
+def get_db_status() -> dict:
+    """Database status, cached for 60 seconds so reruns stay fast."""
+    try:
+        ping()
+        return {
+            "ok": True,
+            "database": collection.database.name,
+            "collection": collection.name,
+            "collections": get_collection_names(),
+            "documents": collection.estimated_document_count(),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def build_history(messages: list[dict]) -> list[dict]:
+    """The last few turns, as plain role/content pairs."""
+    return [
+        {"role": message["role"], "content": message.get("content", "")}
+        for message in messages[-HISTORY_MESSAGES:]
+    ]
 
 
 def render_sources(sources):
-    """Display retrieved documents, if any."""
+    """Show retrieved documents (RAG route)."""
     if not isinstance(sources, list) or not sources:
         return
 
-    with st.expander("📚 Retrieved sources"):
+    with st.expander(f"📚 Retrieved sources ({len(sources)})"):
         for index, source in enumerate(sources, start=1):
             if not isinstance(source, dict):
-                st.write(f"Source {index}: {source}")
+                st.write(f"[{index}] {source}")
                 continue
 
-            title = source.get("title") or f"Source {index}"
-            content = (
-                source.get("content")
-                or source.get("text")
-                or "(No content field)"
-            )
+            title = source.get("title") or source.get("name") or f"Source {index}"
+            st.markdown(f"**[{index}] {title}**")
 
-            st.markdown(f"**{title}**")
-            st.write(content)
+            body = source.get("content") or source.get("text")
+            if body:
+                st.write(body)
+            else:
+                st.json({
+                    key: value
+                    for key, value in source.items()
+                    if key not in {"_id", "vector_score"}
+                })
 
-            score = source.get("score")
+            score = source.get("vector_score")
             if isinstance(score, (int, float)):
-                st.caption(f"Vector score: {score:.3f}")
+                st.caption(f"Relevance score: {score:.3f}")
 
             if index < len(sources):
                 st.divider()
 
 
-def render_query_details(message):
-    """Display query details when the graph returns them."""
-    pipeline = message.get("pipeline")
+def render_query_details(message: dict):
+    """Show the pipeline and result table (database route only)."""
+    if message.get("route") != "database":
+        return
 
-    if pipeline is not None:
-        with st.expander("🔍 Generated MongoDB aggregation pipeline"):
+    pipeline = message.get("pipeline")
+    if pipeline:
+        with st.expander("🔍 Generated MongoDB pipeline"):
             st.json(pipeline)
 
     results = message.get("results")
+    if results:
+        with st.expander(f"🗃️ Database results ({len(results)} row(s))", expanded=True):
+            try:
+                st.dataframe(results, width="stretch")
+            except Exception:
+                st.json(results)
 
-    if results is not None:
-        with st.expander("🗃️ Database results"):
-            st.json(results)
 
-
-def render_assistant_message(message):
-    """Render a saved assistant response and its extra details."""
-    st.markdown(message.get("content", "No answer returned."))
+def render_assistant_message(message: dict):
+    st.markdown(message.get("content") or "No answer returned.")
 
     route = message.get("route")
     if route:
-        st.caption(f"LangGraph route: `{route}`")
+        st.caption(f"Route: `{route}`")
 
     render_query_details(message)
-    render_sources(message.get("sources"))
 
-    error = message.get("error")
-    if error:
-        st.warning(error)
+    if route == "rag":
+        render_sources(message.get("sources"))
 
-    # Detailed errors are useful while developing.
-    debug_error = message.get("debug_error")
-    if debug_error:
+    if SHOW_DEBUG and message.get("debug_error"):
         with st.expander("Developer error details"):
-            st.code(debug_error)
+            st.code(message["debug_error"])
 
 
 # --------------------------------------------------
@@ -101,65 +139,50 @@ def render_assistant_message(message):
 with st.sidebar:
     st.header("Project status")
 
-    try:
-        check_mongodb_connection()
-        st.success("MongoDB connection successful")
+    status = get_db_status()
 
-        st.write("Database:", collection.database.name)
-        st.write("Collection:", collection.name)
-
-        collection_names = get_collection_names()
+    if status["ok"]:
+        st.success("MongoDB connected")
+        st.write("Database:", status["database"])
+        st.write("Collection:", status["collection"])
         st.write(
             "Collections:",
-            ", ".join(collection_names) if collection_names else "None found",
+            ", ".join(status["collections"]) if status["collections"] else "None found",
         )
-
-        st.metric(
-            "Documents in collection",
-            collection.count_documents({}),
-        )
-
-    except Exception:
-        st.error("Could not verify the MongoDB connection.")
+        st.metric("Documents in collection", status["documents"])
+    else:
+        st.error("Could not connect to MongoDB.")
         st.caption(
-            "Check your .env settings and database connection. "
-            "We will inspect db.py next."
+            "Check your .env settings, your internet connection, and that your "
+            "IP address is allowed in Atlas (Network Access)."
         )
+        if SHOW_DEBUG:
+            st.code(status["error"])
 
-    st.info(
-        "Vector Search requires an Atlas index configured for your "
-        "embedding field if your retrieval code uses Atlas Vector Search."
-    )
+    if st.button("Recheck connection"):
+        get_db_status.clear()
+        st.rerun()
 
     st.divider()
     st.subheader("Try asking")
 
-    example_questions = [
-        "What is a DBMS?",
-        "Explain primary keys.",
-        "How many documents are in this collection?",
-    ]
+    for example in EXAMPLE_QUESTIONS:
+        if st.button(example, key=f"example-{example}", width="stretch"):
+            st.session_state.queued_question = example
 
-    for example in example_questions:
-        st.markdown(f"- {example}")
+    st.divider()
 
-    st.caption(
-        "The answers depend on the database content and the "
-        "query/retrieval logic implemented in the project."
-    )
+    if st.button("Clear chat", width="stretch"):
+        st.session_state.messages = []
+        st.rerun()
 
 
 # --------------------------------------------------
-# 4. Initialise chat history
+# 4. Chat history
 # --------------------------------------------------
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
-
-
-# --------------------------------------------------
-# 5. Display previous messages
-# --------------------------------------------------
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
@@ -170,56 +193,37 @@ for message in st.session_state.messages:
 
 
 # --------------------------------------------------
-# 6. Handle a new question
+# 5. Handle a new question
 # --------------------------------------------------
 
 question = st.chat_input("Ask a question about your MongoDB data...")
 
-if question:
-    # Show and save the user's question.
-    st.session_state.messages.append(
-        {"role": "user", "content": question}
-    )
+# An example button queues its text so it is handled like a typed question.
+if not question:
+    question = st.session_state.pop("queued_question", None)
 
+if question:
+    history = build_history(st.session_state.messages)  # before adding this turn
+
+    st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    # Run the chatbot without letting an exception crash the page.
     with st.chat_message("assistant"):
-        with st.spinner("Thinking and querying your data..."):
-            try:
-                result = ask(question)
+        with st.spinner("Thinking..."):
+            result = ask(question, history=history)  # never raises
 
-                if not isinstance(result, dict):
-                    raise TypeError(
-                        "The ask() function must return a dictionary."
-                    )
-
-                answer = result.get("answer") or "No answer returned."
-
-                assistant_message = {
-                    "role": "assistant",
-                    "content": str(answer),
-                    "route": result.get("route"),
-                    "pipeline": result.get("pipeline"),
-                    "results": result.get("results", []),
-                    "sources": result.get("sources", []),
-                    "error": result.get("error"),
-                }
-
-            except Exception as exc:
-                assistant_message = {
-                    "role": "assistant",
-                    "content": (
-                        "Sorry, something went wrong while processing "
-                        "your question. Please check the error details "
-                        "below while debugging."
-                    ),
-                    "error": "The chatbot could not complete this request.",
-                    "debug_error": f"{type(exc).__name__}: {exc}",
-                }
+        assistant_message = {
+            "role": "assistant",
+            "content": str(result.get("answer") or "No answer returned."),
+            "route": result.get("route"),
+            "pipeline": result.get("pipeline"),
+            "results": result.get("results"),
+            "sources": result.get("sources"),
+            "debug_error": result.get("error"),
+        }
 
         render_assistant_message(assistant_message)
 
-        # Save the full response so it remains visible after reruns.
-        st.session_state.messages.append(assistant_message)
+    # Save the full response so it stays visible after reruns.
+    st.session_state.messages.append(assistant_message)
